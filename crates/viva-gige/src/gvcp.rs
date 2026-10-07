@@ -835,6 +835,7 @@ fn single_register_address(addr: u64, len: usize) -> Option<u32> {
 pub struct GigeDevice {
     socket: UdpSocket,
     remote: SocketAddr,
+    control_timeout: Duration,
     request_id: u16,
     rng: Rng,
     /// Single-register access goes out as READMEM/WRITEMEM instead of
@@ -881,10 +882,25 @@ impl GigeDevice {
         Ok(Self {
             socket,
             remote: addr,
+            control_timeout: consts::CONTROL_TIMEOUT,
             request_id: 1,
             rng: Rng::new(),
             memory_access_only,
         })
+    }
+
+    /// Set the acknowledgement timeout per control transaction attempt.
+    ///
+    /// Applies to register/memory access, control privilege and packet resend.
+    /// PENDING_ACK may extend this wait, but never shorten it. Automatic retries
+    /// retain their existing limit. Zero requests an immediate timeout.
+    pub fn set_control_timeout(&mut self, timeout: Duration) {
+        self.control_timeout = timeout;
+    }
+
+    /// Return the acknowledgement timeout per control transaction attempt.
+    pub fn control_timeout(&self) -> Duration {
+        self.control_timeout
     }
 
     /// Send every single-register access as READMEM/WRITEMEM from now on.
@@ -1076,7 +1092,7 @@ impl GigeDevice {
     /// extend its own deadline by the time the device requests and keep
     /// waiting on the same request id.
     async fn recv_absorbing_pending(&mut self, buf: &mut [u8], request_id: u16) -> AckRecv {
-        let mut wait = consts::CONTROL_TIMEOUT;
+        let mut wait = self.control_timeout;
         let mut pending_seen = 0usize;
         loop {
             match time::timeout(wait, self.socket.recv(buf)).await {
@@ -1100,7 +1116,9 @@ impl GigeDevice {
                         );
                         return AckRecv::TimedOut;
                     }
-                    wait = requested.clamp(consts::CONTROL_TIMEOUT, consts::MAX_PENDING_ACK_WAIT);
+                    wait = requested
+                        .clamp(consts::CONTROL_TIMEOUT, consts::MAX_PENDING_ACK_WAIT)
+                        .max(self.control_timeout);
                     debug!(
                         request_id,
                         requested_ms = requested.as_millis() as u64,
@@ -1554,7 +1572,7 @@ impl GigeDevice {
         );
         self.socket.send(&packet).await?;
         let mut buf = [0u8; viva_gencp::HEADER_SIZE];
-        match time::timeout(consts::CONTROL_TIMEOUT, self.socket.recv(&mut buf)).await {
+        match time::timeout(self.control_timeout, self.socket.recv(&mut buf)).await {
             Ok(Ok(len)) => {
                 if len != viva_gencp::HEADER_SIZE {
                     return Err(GigeError::Protocol("resend ack length mismatch".into()));
@@ -1596,6 +1614,92 @@ impl GigeDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reply after the upstream default deadline and count queued retries.
+    async fn delayed_control_ack(
+        opcode: u16,
+        payload: Vec<u8>,
+        pending: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let address = socket.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            let (_, peer) = socket.recv_from(&mut buffer).await.expect("request");
+            assert_eq!(u16::from_be_bytes([buffer[2], buffer[3]]), opcode);
+            let request_id = u16::from_be_bytes([buffer[6], buffer[7]]);
+            if pending {
+                socket
+                    .send_to(&golden_pending_ack(request_id, 50), peer)
+                    .await
+                    .expect("pending ack");
+            }
+            time::sleep(Duration::from_millis(650)).await;
+            let mut ack = Vec::new();
+            ack.extend_from_slice(&0u16.to_be_bytes());
+            ack.extend_from_slice(&(opcode + 1).to_be_bytes());
+            ack.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            ack.extend_from_slice(&request_id.to_be_bytes());
+            ack.extend_from_slice(&payload);
+            socket.send_to(&ack, peer).await.expect("ack");
+            let mut requests = 1;
+            while time::timeout(Duration::from_millis(50), socket.recv_from(&mut buffer))
+                .await
+                .is_ok()
+            {
+                requests += 1;
+            }
+            requests
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn configured_control_timeout_covers_register_and_memory_reads_and_writes() {
+        for opcode in [0x0080, 0x0082, 0x0084, 0x0086] {
+            let value = 0xCAFEBABEu32.to_be_bytes();
+            let payload = match opcode {
+                0x0080 => value.to_vec(),
+                0x0084 => [0x2000u32.to_be_bytes(), value].concat(),
+                _ => 0u32.to_be_bytes().to_vec(),
+            };
+            // A short PENDING_ACK must not shorten the configured timeout.
+            let (address, server) = delayed_control_ack(opcode, payload, opcode == 0x0086).await;
+            let mut device = GigeDevice::open(address).await.expect("open");
+            assert_eq!(device.control_timeout(), consts::CONTROL_TIMEOUT);
+            device.set_control_timeout(Duration::from_secs(2));
+            match opcode {
+                0x0080 => assert_eq!(
+                    device.read_register(0x2000).await.expect("read"),
+                    0xCAFEBABE
+                ),
+                0x0082 => device.write_register(0x2000, 1).await.expect("write"),
+                0x0084 => assert_eq!(device.read_mem(0x2000, 4).await.expect("read"), value),
+                0x0086 => device.write_mem(0x2000, &value).await.expect("write"),
+                _ => unreachable!(),
+            }
+            assert_eq!(server.await.expect("server"), 1, "request was resent");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_configured_timeout_exhausts_the_existing_retry_budget() {
+        // Keep the peer bound, but never acknowledge the command.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let mut device = GigeDevice::open(socket.local_addr().expect("address"))
+            .await
+            .expect("open");
+        device.set_control_timeout(Duration::from_millis(20));
+        let result = time::timeout(Duration::from_secs(1), device.read_register(0x2000))
+            .await
+            .expect("configured timeout was ignored");
+        assert!(matches!(result, Err(GigeError::Timeout)));
+        let mut buffer = [0u8; 2048];
+        for _ in 0..consts::MAX_RETRIES {
+            socket.try_recv(&mut buffer).expect("retry");
+        }
+        assert!(socket.try_recv(&mut buffer).is_err());
+    }
 
     /// A Discovery ACK payload written out from the specification's field
     /// table, with a distinct recognisable value in every field.

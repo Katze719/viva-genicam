@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configurable GVCP acknowledgement timeouts through
+  `GigeDevice::set_control_timeout`, including register and memory access.
+
+### Fixed
+
+- Cancel and drain control-channel keepalive I/O when `GigeRegisterIo` is
+  dropped, preventing timer registration from racing runtime shutdown.
+
 ## [0.7.0] - 2026-09-30
 
 Three changes need a read before upgrading. **`viva_zenoh_api::API_VERSION` is
