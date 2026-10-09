@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- GigE control heartbeats continue during long register/memory ACK waits,
+  including `PENDING_ACK` extensions, while `GigeRegisterIo` holds the device
+  mutex. The socket owner sends CCP reads with separate request IDs and drains
+  their delayed or duplicate replies without extending the original deadline
+  or repeating the active operation. Memory-only sessions use READMEM probes;
+  packet resend waits also filter unrelated ACKs.
+
+### Added
+
+- `GigeDevice::set_control_timeout` / `control_timeout` configure the ACK
+  timeout per attempt, retaining the 500 ms default. Low-level users can opt
+  into probes during ACK waits with `set_inflight_keepalive_period`; the
+  high-level GigE transport configures them from the device heartbeat window.
+
 ## [0.7.0] - 2026-09-30
 
 Three changes need a read before upgrading. **`viva_zenoh_api::API_VERSION` is

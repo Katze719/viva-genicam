@@ -76,7 +76,10 @@ Implementations:
   spawns a task that reads `GevHeartbeatTimeout` and refreshes the device's
   timer at a quarter of it, and dropping one retires that task. Holding the
   transport is therefore sufficient to hold control privilege — nothing above
-  this layer runs a heartbeat.
+  this layer runs a heartbeat. While a register operation holds the device
+  mutex, the GVCP receive loop itself sends CCP probes and drains their ACKs
+  by request ID. The background task covers idle time; the socket owner covers
+  in-flight waits ([ADR-0023](adrs/adr0023-inflight-gvcp-heartbeats.md)).
 - `MockIo` — in-memory register map for tests.
 - `NullIo` — no-op backend for offline XML browsing (studio, wasm).
 
