@@ -49,4 +49,6 @@ skips the active transaction's ID if the 16-bit counter wraps.
 - Cameras must process CCP reads while another operation is pending. The
   regression fixture exercises this behavior; the transport fix also needs
   hardware testing before assuming it works on every device.
-- The existing background keepalive shutdown lifecycle is unchanged.
+- Probes run only inside a receive wait that some caller is already blocked
+  on, so they need no shutdown of their own: dropping `GigeRegisterIo`
+  cancels the idle task's wait (#162), and with it any probe it would send.

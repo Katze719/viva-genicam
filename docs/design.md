@@ -74,7 +74,8 @@ Implementations:
   `block_in_place` + `block_on`; safe to call from both async and sync
   contexts. Also **owns the control-channel keepalive**: constructing one
   spawns a task that reads `GevHeartbeatTimeout` and refreshes the device's
-  timer at a quarter of it, and dropping one retires that task. Holding the
+  timer at a quarter of it, and dropping one cancels and drains its I/O before
+  runtime shutdown. The runtime must outlive the transport. Holding the
   transport is therefore sufficient to hold control privilege — nothing above
   this layer runs a heartbeat. While a register operation holds the device
   mutex, the GVCP receive loop itself sends CCP probes and drains their ACKs

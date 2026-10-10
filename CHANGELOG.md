@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `GigeDevice::set_control_timeout` / `control_timeout` configure the GVCP ACK
+  timeout per attempt — register and memory access, control privilege and
+  packet resend — retaining the 500 ms default. Low-level users can opt into
+  probes during ACK waits with `set_inflight_keepalive_period`; the high-level
+  GigE transport configures them from the device heartbeat window.
+
 ### Fixed
 
 - GigE control heartbeats continue during long register/memory ACK waits,
@@ -15,13 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their delayed or duplicate replies without extending the original deadline
   or repeating the active operation. Memory-only sessions use READMEM probes;
   packet resend waits also filter unrelated ACKs.
-
-### Added
-
-- `GigeDevice::set_control_timeout` / `control_timeout` configure the ACK
-  timeout per attempt, retaining the 500 ms default. Low-level users can opt
-  into probes during ACK waits with `set_inflight_keepalive_period`; the
-  high-level GigE transport configures them from the device heartbeat window.
+- Cancel and drain control-channel keepalive I/O when `GigeRegisterIo` is
+  dropped, preventing timer registration from racing runtime shutdown.
 
 ## [0.7.0] - 2026-09-30
 

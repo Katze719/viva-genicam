@@ -768,6 +768,8 @@ pub struct ChunkConfig {
 pub struct GigeRegisterIo {
     handle: tokio::runtime::Handle,
     device: Arc<Mutex<GigeDevice>>,
+    keepalive_stop: Option<tokio::sync::watch::Sender<bool>>,
+    keepalive_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GigeRegisterIo {
@@ -786,14 +788,24 @@ impl GigeRegisterIo {
     ///
     /// The keepalive stops when the adapter is dropped, so privilege is
     /// maintained for exactly as long as the transport that needs it.
+    /// Dropping the adapter cancels and drains any in-flight keepalive I/O.
+    /// The runtime must remain alive until the adapter has been dropped. On a
+    /// current-thread runtime the async task is aborted, since blocking on its
+    /// completion would prevent that same runtime from making progress.
     pub fn new(handle: tokio::runtime::Handle, mut device: GigeDevice) -> Self {
         // A register operation holds the device mutex while waiting for its
         // reply. Let the socket owner send heartbeats during that wait; the
         // background task below covers idle periods and refines this period.
         device.set_inflight_keepalive_period(Some(keepalive_period(None)));
         let device = Arc::new(Mutex::new(device));
-        spawn_keepalive(handle.clone(), Arc::downgrade(&device));
-        Self { handle, device }
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = spawn_keepalive(handle.clone(), Arc::downgrade(&device), stopped);
+        Self {
+            handle,
+            device,
+            keepalive_stop: Some(stop),
+            keepalive_task: Some(task),
+        }
     }
 
     /// Lock the underlying [`GigeDevice`] for direct async operations.
@@ -810,6 +822,48 @@ impl GigeRegisterIo {
         self.device
             .lock()
             .map_err(|_| GenApiError::Io("gige device mutex poisoned".into()))
+    }
+}
+
+impl Drop for GigeRegisterIo {
+    fn drop(&mut self) {
+        if let Some(stop) = self.keepalive_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(task) = self.keepalive_task.take() {
+            if self.handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                // This task cannot progress while its runtime thread is in Drop.
+                // Abort it and synchronize with the blocking operation instead.
+                // Queued operations check cancellation before starting any I/O.
+                task.abort();
+                drop(self.device.lock());
+                return;
+            }
+            // Aborting the async task would detach its spawn_blocking operation,
+            // which can still use Tokio timers. Join both before runtime shutdown.
+            let joined = match tokio::runtime::Handle::try_current() {
+                Ok(current)
+                    if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
+                {
+                    // The adapter belongs to a different, multi-thread runtime.
+                    // block_in_place is unavailable in the caller's runtime.
+                    match std::thread::scope(|scope| {
+                        scope.spawn(|| self.handle.block_on(task)).join()
+                    }) {
+                        Ok(joined) => joined,
+                        Err(_) => {
+                            warn!("keepalive shutdown thread panicked");
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(task)),
+                Err(_) => self.handle.block_on(task),
+            };
+            if let Err(error) = joined {
+                warn!(%error, "control channel keepalive failed during shutdown");
+            }
+        }
     }
 }
 
@@ -890,38 +944,71 @@ fn keepalive_period(reported_timeout_ms: Option<u32>) -> Duration {
 async fn on_blocking_pool<R, F>(
     handle: &tokio::runtime::Handle,
     device: &std::sync::Weak<Mutex<GigeDevice>>,
+    stopped: &mut tokio::sync::watch::Receiver<bool>,
     op: F,
 ) -> Option<Result<R, String>>
 where
-    F: FnOnce(&tokio::runtime::Handle, &mut GigeDevice) -> Result<R, String> + Send + 'static,
+    F: FnOnce(
+            &tokio::runtime::Handle,
+            &mut GigeDevice,
+            &mut tokio::sync::watch::Receiver<bool>,
+        ) -> Result<R, String>
+        + Send
+        + 'static,
     R: Send + 'static,
 {
+    if *stopped.borrow() {
+        return None;
+    }
     let device = device.upgrade()?;
     let handle = handle.clone();
-    let joined = tokio::task::spawn_blocking(move || match device.lock() {
-        Ok(mut guard) => op(&handle, &mut guard),
+    let mut blocking_stopped = stopped.clone();
+    let mut task = tokio::task::spawn_blocking(move || match device.lock() {
+        Ok(mut guard) => {
+            if *blocking_stopped.borrow() {
+                return Err("keepalive stopped".to_string());
+            }
+            op(&handle, &mut guard, &mut blocking_stopped)
+        }
         Err(_) => Err("gige device mutex poisoned".to_string()),
-    })
-    .await;
+    });
+    let joined = tokio::select! {
+        joined = &mut task => joined,
+        _ = stopped.changed() => {
+            // The blocking thread cancels its I/O future; join it so no timer
+            // registration can race the runtime's shutdown.
+            let _ = task.await;
+            return None;
+        }
+    };
+    if *stopped.borrow() {
+        return None;
+    }
     Some(joined.unwrap_or_else(|err| Err(err.to_string())))
 }
 
 /// Keep the device's control channel alive for as long as the transport exists.
 ///
-/// The task holds a [`Weak`](std::sync::Weak) reference to the device, so it
-/// stops on its own once the [`GigeRegisterIo`] is dropped; there is no handle
-/// to remember to shut down, and a replaced connection's keepalive retires with
-/// the connection it belonged to.
+/// The adapter signals cancellation and drains blocking I/O on drop, before
+/// the owning runtime shuts down.
 ///
 /// It contends only for the device mutex — never for whatever lock the
 /// application puts around its [`Camera`] — which is what lets it run without
 /// the pause/resume dance every app-layer copy of this loop needed.
-fn spawn_keepalive(handle: tokio::runtime::Handle, device: std::sync::Weak<Mutex<GigeDevice>>) {
+fn spawn_keepalive(
+    handle: tokio::runtime::Handle,
+    device: std::sync::Weak<Mutex<GigeDevice>>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     handle.clone().spawn(async move {
-        let reported = on_blocking_pool(&handle, &device, |handle, dev| {
-            let reported = handle
-                .block_on(dev.heartbeat_timeout_ms())
-                .map_err(|err| err.to_string());
+        let reported = on_blocking_pool(&handle, &device, &mut stopped, |handle, dev, stopped| {
+            let reported = handle.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = stopped.changed() => Err("keepalive stopped".to_string()),
+                    result = dev.heartbeat_timeout_ms() => result.map_err(|err| err.to_string()),
+                }
+            });
             if let Ok(timeout_ms) = reported {
                 dev.set_inflight_keepalive_period(
                     (timeout_ms != 0).then(|| keepalive_period(Some(timeout_ms))),
@@ -960,11 +1047,18 @@ fn spawn_keepalive(handle: tokio::runtime::Handle, device: std::sync::Weak<Mutex
         let mut consecutive_failures: u32 = 0;
         let mut privilege_seen = false;
         loop {
-            ticker.tick().await;
-            let pinged = on_blocking_pool(&handle, &device, |handle, dev| {
-                handle
-                    .block_on(dev.ping_control_channel())
-                    .map_err(|err| err.to_string())
+            tokio::select! {
+                _ = stopped.changed() => return,
+                _ = ticker.tick() => {}
+            }
+            let pinged = on_blocking_pool(&handle, &device, &mut stopped, |handle, dev, stopped| {
+                handle.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = stopped.changed() => Err("keepalive stopped".to_string()),
+                        result = dev.ping_control_channel() => result.map_err(|err| err.to_string()),
+                    }
+                })
             })
             .await;
             match pinged {
@@ -1001,7 +1095,7 @@ fn spawn_keepalive(handle: tokio::runtime::Handle, device: std::sync::Weak<Mutex
                 }
             }
         }
-    });
+    })
 }
 
 /// Connect to a GigE Vision camera and return a fully configured [`Camera`].
