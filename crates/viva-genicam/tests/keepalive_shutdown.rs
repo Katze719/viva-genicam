@@ -23,6 +23,16 @@ fn transport(runtime: &Runtime, peer: &UdpSocket) -> GigeRegisterIo {
     GigeRegisterIo::new(runtime.handle().clone(), device)
 }
 
+/// A worker releases a finished task only after waking its `JoinHandle`, so
+/// the alive-task count can trail a completed join by a moment.
+fn assert_tasks_released(runtime: &Runtime) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.metrics().num_alive_tasks() != 0 {
+        assert!(Instant::now() < deadline, "keepalive task still alive");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn synchronous_drop_cancels_the_initial_heartbeat_read_and_joins_the_task() {
     let peer = peer();
@@ -32,7 +42,7 @@ fn synchronous_drop_cancels_the_initial_heartbeat_read_and_joins_the_task() {
     let started = Instant::now();
     drop(transport);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(runtime.metrics().num_alive_tasks(), 0);
+    assert_tasks_released(&runtime);
     drop(runtime);
 }
 
@@ -45,7 +55,7 @@ fn dropping_from_a_multithread_runtime_worker_joins_the_keepalive() {
     runtime
         .block_on(runtime.spawn(async move { drop(transport) }))
         .expect("drop task");
-    assert_eq!(runtime.metrics().num_alive_tasks(), 0);
+    assert_tasks_released(&runtime);
 }
 
 #[test]
@@ -63,7 +73,7 @@ fn shutdown_also_cancels_a_periodic_control_ping() {
     let started = Instant::now();
     drop(transport);
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_eq!(runtime.metrics().num_alive_tasks(), 0);
+    assert_tasks_released(&runtime);
 }
 
 #[tokio::test]
@@ -127,5 +137,5 @@ fn a_multithread_transport_can_be_dropped_from_another_current_thread_runtime() 
     let transport = transport(&owner, &peer);
     peer.recv_from(&mut [0u8; 2048]).expect("heartbeat read");
     caller.block_on(async move { drop(transport) });
-    assert_eq!(owner.metrics().num_alive_tasks(), 0);
+    assert_tasks_released(&owner);
 }
